@@ -132,6 +132,36 @@ class Permissions:
         return ans in ("y", "yes")
 
 
+# --- Event sink --------------------------------------------------------------
+
+class EventSink:
+    """Receives agent-loop events. The default implementation prints to stdout
+    in the same look as the original CLI. Override the on_* methods to plug a
+    different frontend in (e.g. the Rich TUI in watchdog_tui.py)."""
+
+    def on_assistant_text(self, text: str, label: str = "agent") -> None:
+        if label == "agent":
+            print(BOLD(GREEN("\nwatchdog:")) + " " + text + "\n")
+
+    def on_tool_call(self, name: str, args: dict) -> None:
+        print(CYAN(f"-> {name}({_short_args(args)})"))
+
+    def on_tool_result(self, name: str, result: str) -> None:
+        print(DIM(f"   {_short_preview(result)}"))
+
+    def on_subtask_start(self, goal: str) -> None:
+        print(DIM(f"   [subtask start] goal={goal[:120]!r}"))
+
+    def on_subtask_end(self) -> None:
+        print(DIM("   [subtask end]"))
+
+    def on_error(self, message: str) -> None:
+        print(RED(message))
+
+    def on_round_cap(self, label: str, max_rounds: int) -> None:
+        print(YELLOW(f"[{label}] hit round limit ({max_rounds}) — stopping."))
+
+
 # --- File operation tools ----------------------------------------------------
 
 def tool_read_file(path: str) -> str:
@@ -440,7 +470,7 @@ def tool_analyze_image(path: str, question: str, vision_model: str) -> str:
 # --- Subtask tool ------------------------------------------------------------
 
 def tool_run_subtask(goal: str, model: str, vision_model: str,
-                     perms: "Permissions", depth: int) -> str:
+                     perms: "Permissions", depth: int, sink: "EventSink") -> str:
     if not goal or not goal.strip():
         return "ERROR: empty goal."
     if depth >= MAX_SUBTASK_DEPTH:
@@ -454,7 +484,7 @@ def tool_run_subtask(goal: str, model: str, vision_model: str,
         {"role": "system", "content": SUBTASK_SYSTEM_PROMPT},
         {"role": "user", "content": goal},
     ]
-    print(DIM(f"   [subtask start] goal={goal[:120]!r}"))
+    sink.on_subtask_start(goal)
     summary = agent_loop(
         messages=messages,
         model=model,
@@ -464,8 +494,9 @@ def tool_run_subtask(goal: str, model: str, vision_model: str,
         depth=depth + 1,
         max_rounds=10,
         label="subtask",
+        sink=sink,
     )
-    print(DIM("   [subtask end]"))
+    sink.on_subtask_end()
     return summary or "(subtask produced no text)"
 
 
@@ -744,7 +775,7 @@ def _parse_args(raw):
     return {}
 
 
-def _call_tool(name, args, model, vision_model, perms, depth):
+def _call_tool(name, args, model, vision_model, perms, depth, sink):
     if name == "read_file":    return tool_read_file(args.get("path", ""))
     if name == "write_file":   return tool_write_file(args.get("path", ""), args.get("content", ""))
     if name == "edit_file":    return tool_edit_file(args.get("path", ""), args.get("old", ""), args.get("new", ""))
@@ -757,7 +788,7 @@ def _call_tool(name, args, model, vision_model, perms, depth):
     if name == "run_tests":    return tool_run_tests(args.get("command"))
     if name == "git":          return tool_git(args.get("subcommand", ""))
     if name == "analyze_image":return tool_analyze_image(args.get("path", ""), args.get("question", ""), vision_model)
-    if name == "run_subtask":  return tool_run_subtask(args.get("goal", ""), model, vision_model, perms, depth)
+    if name == "run_subtask":  return tool_run_subtask(args.get("goal", ""), model, vision_model, perms, depth, sink)
     return f"ERROR: unknown tool '{name}'"
 
 
@@ -821,20 +852,23 @@ def _short_preview(s, limit=160) -> str:
 # --- The agent loop ----------------------------------------------------------
 
 def agent_loop(messages, model, vision_model, perms, tool_specs,
-               depth=0, max_rounds=None, label="agent") -> str:
+               depth=0, max_rounds=None, label="agent", sink=None) -> str:
     """One turn of the agent. Mutates `messages` in place.
 
     Returns the final assistant text (or an empty string on early failure).
+    Output is routed through `sink` (defaults to the print-based EventSink).
     """
     if max_rounds is None:
         max_rounds = MAX_TOOL_ROUNDS
+    if sink is None:
+        sink = EventSink()
 
     last_text = ""
     for _ in range(1, max_rounds + 1):
         try:
             resp = ollama_chat(model, messages, tool_specs)
         except RuntimeError as e:
-            print(RED(str(e)))
+            sink.on_error(str(e))
             return last_text
 
         msg = resp.get("message", {}) or {}
@@ -849,8 +883,7 @@ def agent_loop(messages, model, vision_model, perms, tool_specs,
         if not tool_calls:
             content = msg.get("content", "") or ""
             last_text = content
-            if label == "agent":
-                print(BOLD(GREEN("\nwatchdog:")) + " " + content + "\n")
+            sink.on_assistant_text(content, label)
             return content
 
         # Execute each requested tool call sequentially.
@@ -859,26 +892,25 @@ def agent_loop(messages, model, vision_model, perms, tool_specs,
             name = fn.get("name", "") or ""
             args = _parse_args(fn.get("arguments"))
 
-            print(CYAN(f"-> {name}({_short_args(args)})"))
+            sink.on_tool_call(name, args)
 
             if name in CONFIRM_TOOLS and not perms.ask(name, args):
                 result = "DENIED: user refused this action."
             else:
                 try:
-                    result = _call_tool(name, args, model, vision_model, perms, depth)
+                    result = _call_tool(name, args, model, vision_model, perms, depth, sink)
                 except Exception as e:
                     result = f"ERROR: tool '{name}' raised: {e}"
 
-            print(DIM(f"   {_short_preview(result)}"))
+            sink.on_tool_result(name, result)
             messages.append({
                 "role": "tool",
                 "name": name,
                 "content": str(result),
             })
 
-    capped = f"[{label}] hit round limit ({max_rounds}) — stopping."
-    print(YELLOW(capped))
-    return last_text or capped
+    sink.on_round_cap(label, max_rounds)
+    return last_text or f"[{label}] hit round limit ({max_rounds}) — stopping."
 
 
 # --- REPL --------------------------------------------------------------------
@@ -912,7 +944,7 @@ def repl(model, vision_model, perms):
 
         messages.append({"role": "user", "content": user})
         try:
-            agent_loop(messages, model, vision_model, perms, TOOL_SPECS, depth=0)
+            agent_loop(messages, model, vision_model, perms, TOOL_SPECS, depth=0, sink=EventSink())
         except KeyboardInterrupt:
             print(YELLOW("\n(interrupted)"))
             continue
@@ -929,11 +961,31 @@ def main():
                     help=f"Vision model (default: {DEFAULT_VISION_MODEL})")
     ap.add_argument("--yolo", action="store_true",
                     help="Skip all permission prompts.")
+    ap.add_argument("--web", action="store_true",
+                    help="Launch the browser chat UI instead of the CLI REPL "
+                         "(requires `pip install fastapi uvicorn`).")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="Bind address for --web (default: 127.0.0.1).")
+    ap.add_argument("--port", type=int, default=8765,
+                    help="Port for --web (default: 8765).")
     args = ap.parse_args()
 
-    perms = Permissions(args.yolo)
     try:
-        repl(args.model, args.vision_model, perms)
+        if args.web:
+            try:
+                from watchdog_web import serve
+            except ImportError as e:
+                print(
+                    "--web requires `fastapi` and `uvicorn`. Install with:\n"
+                    "  pip install fastapi uvicorn\n"
+                    f"  ({e})",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            serve(args.model, args.vision_model, args.yolo, args.host, args.port)
+        else:
+            perms = Permissions(args.yolo)
+            repl(args.model, args.vision_model, perms)
     except KeyboardInterrupt:
         print()
 

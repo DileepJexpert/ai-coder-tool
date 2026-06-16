@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>watchdog</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/atom-one-dark.min.css">
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand">
+        <span class="dot"></span>
+        <h1>watchdog</h1>
+      </div>
+      <span class="meta" id="meta">connecting…</span>
+      <button id="reset" title="Clear conversation history">New chat</button>
+    </header>
+
+    <main id="messages">
+      <div class="empty">
+        <div class="empty-title">watchdog</div>
+        <div class="empty-sub">a local coding agent running on Ollama</div>
+        <div class="empty-hints">
+          <div>try: <code>find the auth handling code</code></div>
+          <div>try: <code>read watchdog.py and summarise it</code></div>
+          <div>try: <code>add a CLI flag --debug to watchdog.py</code></div>
+        </div>
+      </div>
+    </main>
+
+    <footer>
+      <form id="composer">
+        <textarea id="input"
+                  placeholder="Ask watchdog…  (Enter to send, Shift+Enter for newline)"
+                  rows="1"
+                  autocomplete="off"
+                  spellcheck="false"></textarea>
+        <button type="submit" id="send" aria-label="Send" title="Send">
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"
+               xmlns="http://www.w3.org/2000/svg">
+            <path d="M.5 8 15 1.5 8.5 15.5 7 9 .5 8z"/>
+          </svg>
+        </button>
+      </form>
+      <div class="hint" id="hint">Ready.</div>
+    </footer>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/common.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
