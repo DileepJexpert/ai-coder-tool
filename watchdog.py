@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""
+watchdog v3 — a local CLI coding agent on Ollama.
+
+A small, self-contained alternative to Claude Code that runs entirely
+against a local Ollama instance. Two deps only: requests + numpy.
+"""
+import argparse
+import base64
+import glob as _glob
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import requests
+
+# Semantic code search is optional: the agent still runs without it.
+try:
+    from codebase_rag import search_code as _rag_search
+except Exception:
+    _rag_search = None
+
+
+# --- Configuration -----------------------------------------------------------
+
+OLLAMA_HOST          = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_MODEL        = "qwen3:8b"            # fits 8GB fully; fast tool-calling
+DEFAULT_VISION_MODEL = "moondream"           # light VLM for 8GB
+EMBED_MODEL          = "nomic-embed-text"    # ~270MB, used by codebase_rag
+NUM_CTX              = 8192
+MAX_TOOL_ROUNDS      = 25                    # safety cap on the agent loop
+MAX_SUBTASK_DEPTH    = 1                     # subtasks cannot spawn subtasks
+
+# Output / IO caps. These exist because a single oversized tool result can
+# blow past NUM_CTX and ruin the rest of the turn.
+MAX_READ_BYTES   = 60 * 1024       # read_file
+MAX_CMD_OUTPUT   = 12 * 1024       # run_command, run_tests, git
+MAX_GREP_HITS    = 200
+CMD_TIMEOUT      = 120
+
+CODE_EXTS_FOR_GREP = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".java", ".kt", ".kts", ".scala",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cs",
+    ".go", ".rs", ".rb", ".php", ".swift",
+    ".sh", ".bash", ".ps1", ".bat",
+    ".sql", ".html", ".css", ".scss", ".vue", ".svelte",
+    ".md", ".rst", ".txt",
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".dart", ".lua", ".pl", ".r", ".jl", ".ex", ".exs",
+}
+
+SKIP_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    "dist", "build", "target", ".idea", ".dart_tool",
+    ".mypy_cache", ".pytest_cache", ".tox", ".next", ".nuxt",
+}
+
+
+# --- Terminal colors ---------------------------------------------------------
+
+_CSI = "\033["
+_USE_COLOR = sys.stdout.isatty()
+
+
+def _c(s, code):
+    return f"{_CSI}{code}m{s}{_CSI}0m" if _USE_COLOR else str(s)
+
+
+def DIM(s):    return _c(s, "2")
+def RED(s):    return _c(s, "31")
+def GREEN(s):  return _c(s, "32")
+def YELLOW(s): return _c(s, "33")
+def BLUE(s):   return _c(s, "34")
+def CYAN(s):   return _c(s, "36")
+def BOLD(s):   return _c(s, "1")
+
+
+# --- System prompts ----------------------------------------------------------
+
+SYSTEM_PROMPT = """You are watchdog, a local coding assistant running on the user's own machine.
+You help with day-to-day coding: finding, reading, and editing code, running commands and tests, inspecting screenshots, and debugging.
+
+Rules:
+- Work step by step. Use ONE tool at a time and read the result before the next step.
+- To find where something lives, call search_code (semantic) or grep/glob FIRST. Do not guess filenames.
+- Read a file before editing it. Make the smallest change that works. Use edit_file/multi_edit with exact, unique snippets.
+- After changing code, run_tests to verify when a test command is available.
+- Use git (read-only) to inspect diffs and history; never assume what changed.
+- For a large, self-contained sub-job, call run_subtask so the main context stays clean.
+- To inspect an image/screenshot/diagram, call analyze_image with a specific question.
+- Keep explanations short. When done, give a one or two line summary and stop calling tools.
+- You operate on the user's real filesystem. Be careful with destructive commands.
+"""
+
+SUBTASK_SYSTEM_PROMPT = """You are watchdog running as a SUBTASK. Complete ONE focused subtask using your tools, then stop and report a SHORT plain-text result summary to the parent agent.
+
+Same rules as the main agent: use search_code/grep/glob to locate code, read before editing, make the smallest change that works, run tests if you changed code. Do not chat. Do not ask follow-ups. When the subtask is done, output a one or two line summary and stop calling tools.
+"""
+
+
+# --- Permission gate ---------------------------------------------------------
+
+class Permissions:
+    """Wraps the y/N confirmation prompt for [confirm] tools.
+
+    --yolo flips ask() to always-allow, including inside subtasks (the same
+    Permissions instance is threaded through).
+    """
+
+    def __init__(self, yolo: bool):
+        self.yolo = yolo
+
+    def ask(self, tool_name: str, args: dict) -> bool:
+        if self.yolo:
+            return True
+        try:
+            preview = json.dumps(args, ensure_ascii=False)
+        except Exception:
+            preview = str(args)
+        if len(preview) > 400:
+            preview = preview[:400] + "...(truncated)"
+        print(YELLOW(f"[confirm] {tool_name}({preview})"))
+        try:
+            ans = input(YELLOW("  Allow? [y/N] ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        return ans in ("y", "yes")
+
+
+# --- File operation tools ----------------------------------------------------
+
+def tool_read_file(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return f"ERROR: file not found: {path}"
+    if not p.is_file():
+        return f"ERROR: not a file: {path}"
+    try:
+        data = p.read_bytes()
+    except OSError as e:
+        return f"ERROR: {e}"
+    truncated = len(data) > MAX_READ_BYTES
+    if truncated:
+        data = data[:MAX_READ_BYTES]
+    text = data.decode("utf-8", errors="replace")
+    if truncated:
+        text += f"\n\n[...truncated at {MAX_READ_BYTES} bytes...]"
+    return text
+
+
+def tool_write_file(path: str, content: str) -> str:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return f"OK: wrote {len(content)} chars to {path}"
+
+
+def tool_edit_file(path: str, old: str, new: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return f"ERROR: file not found: {path}"
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"ERROR: {path} is not valid UTF-8 text."
+    if not old:
+        return "ERROR: `old` is empty. Provide an exact snippet copied from the file."
+    count = text.count(old)
+    if count == 0:
+        return (
+            "ERROR: `old` snippet was not found in the file. "
+            "Copy an exact snippet (including whitespace) from the file."
+        )
+    if count > 1:
+        return (
+            f"ERROR: `old` snippet matches {count} places. "
+            "Provide a larger snippet so it is uniquely present in the file."
+        )
+    p.write_text(text.replace(old, new, 1), encoding="utf-8")
+    return f"OK: replaced 1 occurrence in {path}"
+
+
+def tool_multi_edit(path: str, edits) -> str:
+    if not isinstance(edits, list) or not edits:
+        return "ERROR: `edits` must be a non-empty list of {old, new} objects."
+    p = Path(path)
+    if not p.exists():
+        return f"ERROR: file not found: {path}"
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"ERROR: {path} is not valid UTF-8 text."
+
+    # Apply on a working copy so a failure leaves the file untouched.
+    work = text
+    for i, e in enumerate(edits, 1):
+        if not isinstance(e, dict):
+            return f"ERROR: edit #{i}: must be an object with `old` and `new`."
+        old = e.get("old", "")
+        new = e.get("new", "")
+        if not old:
+            return f"ERROR: edit #{i}: `old` is empty."
+        c = work.count(old)
+        if c == 0:
+            return f"ERROR: edit #{i}: `old` snippet not found (after prior edits)."
+        if c > 1:
+            return f"ERROR: edit #{i}: `old` snippet matches {c} places; make it unique."
+        work = work.replace(old, new, 1)
+
+    p.write_text(work, encoding="utf-8")
+    return f"OK: applied {len(edits)} edits to {path}"
+
+
+def tool_list_dir(path: str = ".") -> str:
+    p = Path(path)
+    if not p.exists():
+        return f"ERROR: not found: {path}"
+    if not p.is_dir():
+        return f"ERROR: not a directory: {path}"
+    entries = []
+    for item in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+        name = item.name
+        if name.startswith(".") or name in SKIP_DIRS:
+            continue
+        entries.append(name + ("/" if item.is_dir() else ""))
+    return "\n".join(entries) if entries else "(empty)"
+
+
+# --- Search tools ------------------------------------------------------------
+
+def tool_search_code(query: str) -> str:
+    if _rag_search is None:
+        return (
+            "ERROR: codebase_rag is not available. "
+            "Make sure codebase_rag.py sits next to watchdog.py and an index exists."
+        )
+    if not query:
+        return "ERROR: empty query."
+    return _rag_search(query, k=5)
+
+
+def _walk_grepable(root: Path):
+    if root.is_file():
+        yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_DIRS and not d.startswith(".")
+        ]
+        for fn in filenames:
+            fp = Path(dirpath) / fn
+            if fp.suffix.lower() in CODE_EXTS_FOR_GREP:
+                yield fp
+
+
+def tool_grep(pattern: str, path: str = ".", regex: bool = False) -> str:
+    if not pattern:
+        return "ERROR: empty pattern."
+    base = Path(path)
+    if not base.exists():
+        return f"ERROR: not found: {path}"
+    pat = None
+    if regex:
+        try:
+            pat = re.compile(pattern)
+        except re.error as e:
+            return f"ERROR: bad regex: {e}"
+
+    hits = []
+    for fp in _walk_grepable(base):
+        try:
+            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                for i, line in enumerate(f, 1):
+                    matched = pat.search(line) if pat else (pattern in line)
+                    if matched:
+                        snippet = line.rstrip("\n")
+                        if len(snippet) > 200:
+                            snippet = snippet[:200] + "..."
+                        hits.append(f"{fp}:{i}: {snippet}")
+                        if len(hits) >= MAX_GREP_HITS:
+                            break
+        except OSError:
+            continue
+        if len(hits) >= MAX_GREP_HITS:
+            break
+
+    if not hits:
+        return "No matches."
+    suffix = f"\n...(capped at {MAX_GREP_HITS} hits)" if len(hits) >= MAX_GREP_HITS else ""
+    return "\n".join(hits) + suffix
+
+
+def tool_glob(pattern: str) -> str:
+    if not pattern:
+        return "ERROR: empty pattern."
+    paths = sorted(_glob.glob(pattern, recursive=True))
+    if not paths:
+        return "No matches."
+    if len(paths) > 200:
+        return "\n".join(paths[:200]) + f"\n...({len(paths) - 200} more)"
+    return "\n".join(paths)
+
+
+# --- Execution tools ---------------------------------------------------------
+
+def tool_run_command(command: str) -> str:
+    if not command or not command.strip():
+        return "ERROR: empty command."
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=CMD_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return f"ERROR: command timed out after {CMD_TIMEOUT}s"
+    except Exception as e:
+        return f"ERROR: {e}"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if len(out) > MAX_CMD_OUTPUT:
+        out = out[:MAX_CMD_OUTPUT] + f"\n...[truncated, total {len(out)} chars]"
+    return f"exit={proc.returncode}\n{out}".rstrip() + "\n"
+
+
+def _guess_test_command() -> str:
+    """Pick a sensible test command based on the files in the cwd."""
+    cwd = Path(".")
+    if (cwd / "pytest.ini").exists() or (cwd / "tests").exists() \
+            or any(cwd.glob("test_*.py")) or any(cwd.glob("*_test.py")):
+        return "pytest -q"
+    if (cwd / "pyproject.toml").exists():
+        return "pytest -q"
+    if (cwd / "pom.xml").exists():
+        return "mvn -q test"
+    if (cwd / "build.gradle.kts").exists() or (cwd / "build.gradle").exists():
+        # Use the wrapper if it exists; fall back to a plain gradle invocation.
+        if (cwd / "gradlew").exists() or (cwd / "gradlew.bat").exists():
+            return "./gradlew test" if os.name != "nt" else "gradlew.bat test"
+        return "gradle test"
+    if (cwd / "package.json").exists():
+        return "npm test"
+    if (cwd / "Cargo.toml").exists():
+        return "cargo test"
+    if (cwd / "go.mod").exists():
+        return "go test ./..."
+    return ""
+
+
+def tool_run_tests(command=None) -> str:
+    cmd = command or _guess_test_command()
+    if not cmd:
+        return (
+            "ERROR: no test command provided and could not guess one from the "
+            "files in this directory. Call again with an explicit `command`."
+        )
+    return tool_run_command(cmd)
+
+
+# --- Version-control tool (read-only) ---------------------------------------
+
+GIT_ALLOWED = {"diff", "log", "status", "blame", "show"}
+
+
+def tool_git(subcommand: str) -> str:
+    if not subcommand or not subcommand.strip():
+        return "ERROR: empty subcommand."
+    # Tokenize naively — read-only commands don't need shell metacharacters,
+    # and avoiding the shell removes a whole class of mistake.
+    parts = subcommand.strip().split()
+    sub = parts[0]
+    if sub not in GIT_ALLOWED:
+        return (
+            f"ERROR: only read-only git subcommands are allowed. "
+            f"Allowed: {sorted(GIT_ALLOWED)}"
+        )
+    try:
+        proc = subprocess.run(
+            ["git"] + parts,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except FileNotFoundError:
+        return "ERROR: `git` is not installed or not on PATH."
+    except subprocess.TimeoutExpired:
+        return "ERROR: git timed out."
+    except Exception as e:
+        return f"ERROR: {e}"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if len(out) > MAX_CMD_OUTPUT:
+        out = out[:MAX_CMD_OUTPUT] + "\n...[truncated]"
+    return f"exit={proc.returncode}\n{out}".rstrip() + "\n"
+
+
+# --- Vision tool -------------------------------------------------------------
+
+def tool_analyze_image(path: str, question: str, vision_model: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return f"ERROR: file not found: {path}"
+    if not p.is_file():
+        return f"ERROR: not a file: {path}"
+    try:
+        b = p.read_bytes()
+    except OSError as e:
+        return f"ERROR: {e}"
+    b64 = base64.b64encode(b).decode("ascii")
+    body = {
+        "model": vision_model,
+        "messages": [{"role": "user", "content": question or "Describe this image.", "images": [b64]}],
+        "stream": False,
+        "options": {"temperature": 0.1, "num_ctx": NUM_CTX},
+    }
+    try:
+        r = requests.post(f"{OLLAMA_HOST}/api/chat", json=body, timeout=300)
+    except requests.RequestException as e:
+        return f"ERROR: Ollama request failed: {e}"
+    if r.status_code != 200:
+        text = (r.text or "").lower()
+        if "not found" in text or "no such" in text or r.status_code == 404:
+            return (
+                f"ERROR: vision model '{vision_model}' isn't pulled. "
+                f"Run: ollama pull {vision_model}"
+            )
+        return f"ERROR: vision call failed ({r.status_code}): {(r.text or '')[:300]}"
+    try:
+        return (r.json().get("message", {}) or {}).get("content", "") or "(empty response)"
+    except Exception as e:
+        return f"ERROR: parsing vision response: {e}"
+
+
+# --- Subtask tool ------------------------------------------------------------
+
+def tool_run_subtask(goal: str, model: str, vision_model: str,
+                     perms: "Permissions", depth: int) -> str:
+    if not goal or not goal.strip():
+        return "ERROR: empty goal."
+    if depth >= MAX_SUBTASK_DEPTH:
+        return (
+            "ERROR: subtask depth limit reached "
+            f"(MAX_SUBTASK_DEPTH={MAX_SUBTASK_DEPTH}); subtasks cannot spawn subtasks."
+        )
+    # The subtask sees every tool EXCEPT run_subtask itself.
+    sub_specs = [t for t in TOOL_SPECS if t["function"]["name"] != "run_subtask"]
+    messages = [
+        {"role": "system", "content": SUBTASK_SYSTEM_PROMPT},
+        {"role": "user", "content": goal},
+    ]
+    print(DIM(f"   [subtask start] goal={goal[:120]!r}"))
+    summary = agent_loop(
+        messages=messages,
+        model=model,
+        vision_model=vision_model,
+        perms=perms,
+        tool_specs=sub_specs,
+        depth=depth + 1,
+        max_rounds=10,
+        label="subtask",
+    )
+    print(DIM("   [subtask end]"))
+    return summary or "(subtask produced no text)"
+
+
+# --- Tool registry (the JSON schemas sent to the model) ---------------------
+
+TOOL_SPECS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read a UTF-8 text file and return its contents (capped at ~60KB). "
+                "ALWAYS call this on a file before editing it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Create or overwrite a file. Parent directories are created. "
+                "Use only for NEW files or whole-file rewrites; for small changes use edit_file. "
+                "Requires user confirmation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Replace EXACTLY ONE occurrence of `old` with `new` in a file. "
+                "`old` must be an exact snippet copied from the file and must appear there "
+                "exactly once. If it is missing or ambiguous the call errors and the file is untouched. "
+                "Requires user confirmation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old": {"type": "string", "description": "Exact unique snippet copied from the file."},
+                    "new": {"type": "string", "description": "Replacement snippet."},
+                },
+                "required": ["path", "old", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "multi_edit",
+            "description": (
+                "Apply several edits to ONE file atomically. `edits` is a list of {old,new} pairs "
+                "applied in order; each `old` must be uniquely present at the moment it is applied. "
+                "If any edit fails, NO edit is written. Use this when one file needs several small "
+                "non-overlapping changes. Requires user confirmation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old": {"type": "string"},
+                                "new": {"type": "string"},
+                            },
+                            "required": ["old", "new"],
+                        },
+                    },
+                },
+                "required": ["path", "edits"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": (
+                "List files and directories in a directory. Skips dotfiles and junk dirs "
+                "(.git, node_modules, __pycache__, etc.)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path; defaults to '.'."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_code",
+            "description": (
+                "Semantic code search over the indexed repo. Use this FIRST to find where something "
+                "lives by meaning (e.g. 'where is auth handled', 'function that parses CSV'). "
+                "Returns the top matching code chunks with file:line headers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Natural-language description of what to find."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": (
+                "Literal or regex text search across code files. Returns 'file:line: matched line' hits. "
+                "Use this for exact strings, identifiers, or symbols when you know what to look for."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string", "description": "Directory or file; defaults to '.'."},
+                    "regex": {"type": "boolean", "description": "If true, treat pattern as a regex."},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": (
+                "Find files by filename pattern (e.g. '**/*Controller.java', 'src/**/*.ts'). "
+                "Returns sorted matching paths. Use for filename lookups, not content search."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Run a shell command via the system shell (PowerShell/cmd on Windows, sh on Linux/macOS). "
+                "Captures stdout+stderr and the exit code; timeout ~120s. Use for one-off builds, "
+                "scripts, or inspection. Requires user confirmation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": (
+                "Run the project's test suite. If `command` is omitted, the agent guesses based on the "
+                "files present (pytest, mvn, gradle, npm, cargo, go test). Call this AFTER editing code "
+                "to verify. Requires user confirmation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Optional explicit test command."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git",
+            "description": (
+                "Run a READ-ONLY git subcommand. Allowed: diff, log, status, blame, show. "
+                "Anything else errors. No permission prompt because nothing is mutated. "
+                "Use to inspect the working tree, history, and diffs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subcommand": {
+                        "type": "string",
+                        "description": "e.g. 'status', 'log -n 5', 'diff HEAD~1', 'show abc1234'",
+                    },
+                },
+                "required": ["subcommand"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_image",
+            "description": (
+                "Ask a vision model a SPECIFIC question about a local image "
+                "(screenshot, diagram, photo). Returns the model's text answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "question": {"type": "string"},
+                },
+                "required": ["path", "question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_subtask",
+            "description": (
+                "Run an ISOLATED inner agent loop on a focused sub-job, with a fresh context. "
+                "Use for a large self-contained piece of work (e.g. 'find every caller of X and "
+                "convert them to Y'). Returns only a short summary to you. Cannot be called from "
+                "inside a subtask."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "Concrete description of the sub-job."},
+                },
+                "required": ["goal"],
+            },
+        },
+    },
+]
+
+CONFIRM_TOOLS = {"write_file", "edit_file", "multi_edit", "run_command", "run_tests"}
+
+
+# --- Tool dispatch -----------------------------------------------------------
+
+def _parse_args(raw):
+    """Tool arguments arrive as a dict OR as a stringified JSON object."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            v = json.loads(raw)
+            return v if isinstance(v, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _call_tool(name, args, model, vision_model, perms, depth):
+    if name == "read_file":    return tool_read_file(args.get("path", ""))
+    if name == "write_file":   return tool_write_file(args.get("path", ""), args.get("content", ""))
+    if name == "edit_file":    return tool_edit_file(args.get("path", ""), args.get("old", ""), args.get("new", ""))
+    if name == "multi_edit":   return tool_multi_edit(args.get("path", ""), args.get("edits", []))
+    if name == "list_dir":     return tool_list_dir(args.get("path", "."))
+    if name == "search_code":  return tool_search_code(args.get("query", ""))
+    if name == "grep":         return tool_grep(args.get("pattern", ""), args.get("path", "."), bool(args.get("regex", False)))
+    if name == "glob":         return tool_glob(args.get("pattern", ""))
+    if name == "run_command":  return tool_run_command(args.get("command", ""))
+    if name == "run_tests":    return tool_run_tests(args.get("command"))
+    if name == "git":          return tool_git(args.get("subcommand", ""))
+    if name == "analyze_image":return tool_analyze_image(args.get("path", ""), args.get("question", ""), vision_model)
+    if name == "run_subtask":  return tool_run_subtask(args.get("goal", ""), model, vision_model, perms, depth)
+    return f"ERROR: unknown tool '{name}'"
+
+
+# --- Ollama HTTP -------------------------------------------------------------
+
+def ollama_chat(model, messages, tools):
+    body = {
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "stream": False,
+        "options": {"num_ctx": NUM_CTX, "temperature": 0.2},
+    }
+    try:
+        r = requests.post(f"{OLLAMA_HOST}/api/chat", json=body, timeout=600)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Ollama request failed: {e}")
+    if r.status_code != 200:
+        raise RuntimeError(f"Ollama /api/chat returned {r.status_code}: {(r.text or '')[:300]}")
+    try:
+        return r.json()
+    except Exception as e:
+        raise RuntimeError(f"Ollama returned non-JSON: {e}")
+
+
+# --- Pretty-printing helpers -------------------------------------------------
+
+def _short_args(args) -> str:
+    if not isinstance(args, dict):
+        return str(args)[:120]
+    parts = []
+    for k, v in args.items():
+        if isinstance(v, str):
+            s = v.replace("\n", "\\n")
+            if len(s) > 60:
+                s = s[:60] + "..."
+            parts.append(f"{k}={s!r}")
+        elif isinstance(v, (int, float, bool)) or v is None:
+            parts.append(f"{k}={v}")
+        else:
+            try:
+                s = json.dumps(v, ensure_ascii=False)
+            except Exception:
+                s = str(v)
+            if len(s) > 60:
+                s = s[:60] + "..."
+            parts.append(f"{k}={s}")
+    s = ", ".join(parts)
+    if len(s) > 200:
+        s = s[:200] + "..."
+    return s
+
+
+def _short_preview(s, limit=160) -> str:
+    s = str(s).replace("\n", " | ")
+    if len(s) > limit:
+        s = s[:limit] + "..."
+    return s
+
+
+# --- The agent loop ----------------------------------------------------------
+
+def agent_loop(messages, model, vision_model, perms, tool_specs,
+               depth=0, max_rounds=None, label="agent") -> str:
+    """One turn of the agent. Mutates `messages` in place.
+
+    Returns the final assistant text (or an empty string on early failure).
+    """
+    if max_rounds is None:
+        max_rounds = MAX_TOOL_ROUNDS
+
+    last_text = ""
+    for _ in range(1, max_rounds + 1):
+        try:
+            resp = ollama_chat(model, messages, tool_specs)
+        except RuntimeError as e:
+            print(RED(str(e)))
+            return last_text
+
+        msg = resp.get("message", {}) or {}
+        # Echo the assistant message into history verbatim, including any
+        # tool_calls so the model sees its own prior calls on the next round.
+        assistant_msg = {"role": "assistant", "content": msg.get("content", "") or ""}
+        if msg.get("tool_calls"):
+            assistant_msg["tool_calls"] = msg["tool_calls"]
+        messages.append(assistant_msg)
+
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            content = msg.get("content", "") or ""
+            last_text = content
+            if label == "agent":
+                print(BOLD(GREEN("\nwatchdog:")) + " " + content + "\n")
+            return content
+
+        # Execute each requested tool call sequentially.
+        for call in tool_calls:
+            fn = (call.get("function") or {})
+            name = fn.get("name", "") or ""
+            args = _parse_args(fn.get("arguments"))
+
+            print(CYAN(f"-> {name}({_short_args(args)})"))
+
+            if name in CONFIRM_TOOLS and not perms.ask(name, args):
+                result = "DENIED: user refused this action."
+            else:
+                try:
+                    result = _call_tool(name, args, model, vision_model, perms, depth)
+                except Exception as e:
+                    result = f"ERROR: tool '{name}' raised: {e}"
+
+            print(DIM(f"   {_short_preview(result)}"))
+            messages.append({
+                "role": "tool",
+                "name": name,
+                "content": str(result),
+            })
+
+    capped = f"[{label}] hit round limit ({max_rounds}) — stopping."
+    print(YELLOW(capped))
+    return last_text or capped
+
+
+# --- REPL --------------------------------------------------------------------
+
+def _new_messages():
+    return [{"role": "system", "content": SYSTEM_PROMPT}]
+
+
+def repl(model, vision_model, perms):
+    print(BOLD(BLUE(
+        f"watchdog v3  —  model={model}, vision={vision_model}, "
+        f"yolo={'on' if perms.yolo else 'off'}, host={OLLAMA_HOST}"
+    )))
+    print(DIM("Type /reset to clear history, /exit or /quit to leave."))
+
+    messages = _new_messages()
+    while True:
+        try:
+            user = input(BOLD("you> ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not user:
+            continue
+        if user in ("/exit", "/quit"):
+            return
+        if user == "/reset":
+            messages = _new_messages()
+            print(DIM("(history cleared)"))
+            continue
+
+        messages.append({"role": "user", "content": user})
+        try:
+            agent_loop(messages, model, vision_model, perms, TOOL_SPECS, depth=0)
+        except KeyboardInterrupt:
+            print(YELLOW("\n(interrupted)"))
+            continue
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="watchdog",
+        description="Local CLI coding agent on Ollama.",
+    )
+    ap.add_argument("-m", "--model", default=DEFAULT_MODEL,
+                    help=f"Chat model (default: {DEFAULT_MODEL})")
+    ap.add_argument("--vision-model", default=DEFAULT_VISION_MODEL,
+                    help=f"Vision model (default: {DEFAULT_VISION_MODEL})")
+    ap.add_argument("--yolo", action="store_true",
+                    help="Skip all permission prompts.")
+    args = ap.parse_args()
+
+    perms = Permissions(args.yolo)
+    try:
+        repl(args.model, args.vision_model, perms)
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()
