@@ -434,3 +434,24 @@ footer { padding: 14px 20px 18px; border-top: 1px solid var(--border); }
 }
 .hint.busy  { color: var(--accent); }
 .hint.error { color: var(--error); }
+
+/* ---------------- generated images ---------------- */
+
+.tool-image {
+  display: block;
+  max-width: 100%;
+  margin-top: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #050709;
+}
+
+/* Images that appear inside markdown (assistant bubbles) — when the agent
+   embeds the generated image with ![alt](images/foo.png). */
+.md img {
+  display: block;
+  max-width: 100%;
+  margin: 10px 0;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}

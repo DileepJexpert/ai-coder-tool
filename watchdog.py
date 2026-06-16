@@ -8,11 +8,14 @@ against a local Ollama instance. Two deps only: requests + numpy.
 import argparse
 import base64
 import glob as _glob
+import hashlib
+import html
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -27,6 +30,7 @@ except Exception:
 # --- Configuration -----------------------------------------------------------
 
 OLLAMA_HOST          = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+A1111_HOST           = os.environ.get("A1111_HOST",  "http://localhost:7860")
 DEFAULT_MODEL        = "qwen3:8b"            # fits 8GB fully; fast tool-calling
 DEFAULT_VISION_MODEL = "moondream"           # light VLM for 8GB
 EMBED_MODEL          = "nomic-embed-text"    # ~270MB, used by codebase_rag
@@ -81,17 +85,31 @@ def BOLD(s):   return _c(s, "1")
 
 # --- System prompts ----------------------------------------------------------
 
-SYSTEM_PROMPT = """You are watchdog, a local coding assistant running on the user's own machine.
-You help with day-to-day coding: finding, reading, and editing code, running commands and tests, inspecting screenshots, and debugging.
+SYSTEM_PROMPT = """You are watchdog, a local AI assistant running on the user's own machine.
+You help with day-to-day work: writing code, writing tutorials and learning material
+for kids (class 1-5), creating illustrations to go with them, and general tasks.
 
-Rules:
-- Work step by step. Use ONE tool at a time and read the result before the next step.
-- To find where something lives, call search_code (semantic) or grep/glob FIRST. Do not guess filenames.
-- Read a file before editing it. Make the smallest change that works. Use edit_file/multi_edit with exact, unique snippets.
+For CODE:
+- Use search_code (semantic) or grep/glob FIRST to find where something lives. Do not guess filenames.
+- Read a file before editing it. Make the smallest change that works. Use edit_file/multi_edit
+  with exact, unique snippets.
 - After changing code, run_tests to verify when a test command is available.
 - Use git (read-only) to inspect diffs and history; never assume what changed.
+
+For TUTORIALS / KIDS' LEARNING MATERIAL (class 1-5):
+- Use clear, age-appropriate language. Class 1-2: short sentences, small words.
+  Class 3-5: longer paragraphs and a few examples are fine.
+- Structure: short intro, worked examples, a small set of practice questions, an answer key.
+- When an illustration would help (animals, objects to count, scenes, math diagrams),
+  call generate_image with a vivid child-friendly prompt — include style hints like
+  "children's book illustration, cartoon, flat colors, bright, friendly".
+- Save the final material as a markdown file with write_file. Reference any generated
+  images inline using ![alt](images/<file>) so they render in the chat.
+
+General rules:
+- Work step by step. Use ONE tool at a time and read the result before the next step.
 - For a large, self-contained sub-job, call run_subtask so the main context stays clean.
-- To inspect an image/screenshot/diagram, call analyze_image with a specific question.
+- To inspect a local image/diagram, call analyze_image with a specific question.
 - Keep explanations short. When done, give a one or two line summary and stop calling tools.
 - You operate on the user's real filesystem. Be careful with destructive commands.
 """
@@ -467,6 +485,93 @@ def tool_analyze_image(path: str, question: str, vision_model: str) -> str:
         return f"ERROR: parsing vision response: {e}"
 
 
+# --- Image generation tool ---------------------------------------------------
+
+IMAGES_DIR = Path("images")
+
+
+def _safe_image_slug(name: str) -> str:
+    """Filename-safe ASCII slug. No path separators, no dotfiles, max 60 chars."""
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "_", name or "").strip("_").lower()
+    return s[:60] or "image"
+
+
+def _a1111_txt2img(prompt: str, width: int, height: int, steps: int):
+    """Call AUTOMATIC1111 / Forge text-to-image. Returns PNG bytes or None on any failure."""
+    try:
+        r = requests.post(
+            f"{A1111_HOST}/sdapi/v1/txt2img",
+            json={
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "sampler_name": "Euler a",
+            },
+            timeout=300,
+        )
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        imgs = r.json().get("images") or []
+        return base64.b64decode(imgs[0]) if imgs else None
+    except Exception:
+        return None
+
+
+def _stub_svg(prompt: str, width: int, height: int) -> bytes:
+    """Placeholder image: gradient + the prompt text. Used when SD isn't reachable."""
+    digest = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+    c1, c2 = "#" + digest[:6], "#" + digest[6:12]
+    body = html.escape(prompt)
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+        f'<defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">'
+        f'<stop offset="0%" stop-color="{c1}"/><stop offset="100%" stop-color="{c2}"/>'
+        f'</linearGradient></defs>'
+        f'<rect width="{width}" height="{height}" fill="url(#g)"/>'
+        f'<text x="{width // 2}" y="36" text-anchor="middle" font-family="sans-serif" '
+        f'font-size="20" font-weight="700" fill="white" opacity="0.85">[ stub image ]</text>'
+        f'<foreignObject x="20" y="60" width="{width - 40}" height="{height - 80}">'
+        f'<div xmlns="http://www.w3.org/1999/xhtml" '
+        f'style="color:white;font-family:sans-serif;font-size:18px;line-height:1.4;'
+        f'text-shadow:0 1px 4px rgba(0,0,0,0.4);word-wrap:break-word;">{body}</div>'
+        f'</foreignObject></svg>'
+    )
+    return svg.encode("utf-8")
+
+
+def tool_generate_image(prompt: str, filename: str = "",
+                        width: int = 512, height: int = 512, steps: int = 20) -> str:
+    if not prompt or not prompt.strip():
+        return "ERROR: empty prompt."
+    # Snap to multiples of 8 — most SD samplers require it; safe no-op otherwise.
+    width  = (max(64, min(int(width  or 512), 2048)) // 8) * 8
+    height = (max(64, min(int(height or 512), 2048)) // 8) * 8
+    steps  = max(1, min(int(steps or 20), 150))
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    slug = _safe_image_slug(filename or prompt)
+
+    png = _a1111_txt2img(prompt, width, height, steps)
+    if png is not None:
+        out = IMAGES_DIR / f"{ts}-{slug}.png"
+        out.write_bytes(png)
+        return f"OK: image saved to {out.as_posix()} (generated via {A1111_HOST})"
+
+    out = IMAGES_DIR / f"{ts}-{slug}.svg"
+    out.write_bytes(_stub_svg(prompt, width, height))
+    return (
+        f"OK: stub image saved to {out.as_posix()}\n"
+        f"NOTE: AUTOMATIC1111 was not reachable at {A1111_HOST} — wrote a placeholder SVG. "
+        f"Start AUTOMATIC1111 / Forge with `--api` to get real images."
+    )
+
+
 # --- Subtask tool ------------------------------------------------------------
 
 def tool_run_subtask(goal: str, model: str, vision_model: str,
@@ -739,6 +844,41 @@ TOOL_SPECS = [
     {
         "type": "function",
         "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate an image from a text prompt and save it under images/. "
+                "Use this when an illustration would help — e.g. cartoon animals, kid-friendly "
+                "math counters, scenes for a story or tutorial. Reference the saved path in "
+                "markdown as ![alt](images/<file>) so it renders inline in the chat. "
+                "Backend is AUTOMATIC1111 / Forge at $A1111_HOST; if that's not reachable, "
+                "a labeled placeholder SVG is written instead so the rest of the workflow still runs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "Vivid description of the image. Use simple, concrete language. "
+                            "For kid material include style hints like 'children's book illustration, "
+                            "cartoon, flat colors, bright, friendly'."
+                        ),
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Short slug for the filename (no extension). Optional.",
+                    },
+                    "width":  {"type": "integer", "description": "Width in pixels, 64-2048. Default 512."},
+                    "height": {"type": "integer", "description": "Height in pixels, 64-2048. Default 512."},
+                    "steps":  {"type": "integer", "description": "Sampler steps, 1-150. Default 20."},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_subtask",
             "description": (
                 "Run an ISOLATED inner agent loop on a focused sub-job, with a fresh context. "
@@ -788,6 +928,14 @@ def _call_tool(name, args, model, vision_model, perms, depth, sink):
     if name == "run_tests":    return tool_run_tests(args.get("command"))
     if name == "git":          return tool_git(args.get("subcommand", ""))
     if name == "analyze_image":return tool_analyze_image(args.get("path", ""), args.get("question", ""), vision_model)
+    if name == "generate_image":
+        return tool_generate_image(
+            args.get("prompt", ""),
+            args.get("filename", ""),
+            int(args.get("width", 512) or 512),
+            int(args.get("height", 512) or 512),
+            int(args.get("steps", 20) or 20),
+        )
     if name == "run_subtask":  return tool_run_subtask(args.get("goal", ""), model, vision_model, perms, depth, sink)
     return f"ERROR: unknown tool '{name}'"
 

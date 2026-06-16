@@ -260,7 +260,11 @@ def serve(model: str, vision_model: str, yolo: bool, host: str, port: int) -> No
             "It should ship next to watchdog_web.py."
         )
     _session = WebSession(model, vision_model, yolo)
+    # Make sure images/ exists before mounting it (FastAPI errors otherwise).
+    images_dir = Path("images")
+    images_dir.mkdir(exist_ok=True)
     app.mount("/static", StaticFiles(directory=_WEB_DIR), name="static")
+    app.mount("/images", StaticFiles(directory=images_dir), name="images")
     try:
         import uvicorn
     except ImportError as e:

@@ -15,7 +15,7 @@ let busy = false;
 
 // Tools we expand inline by default because the args themselves are the point.
 const EXPAND_BY_DEFAULT = new Set([
-  "edit_file", "multi_edit", "write_file", "run_command", "run_tests",
+  "edit_file", "multi_edit", "write_file", "run_command", "run_tests", "generate_image",
 ]);
 
 // ---------------- boot ----------------
@@ -162,6 +162,10 @@ function summarizeArgs(name, args) {
     case "run_tests":    return args.command || "(auto-detected)";
     case "git":          return args.subcommand || "";
     case "run_subtask":  return args.goal || "";
+    case "generate_image": {
+      const p = (args.prompt || "").trim();
+      return p.length > 80 ? p.slice(0, 80) + "…" : p;
+    }
     default:
       try { return JSON.stringify(args); } catch { return ""; }
   }
@@ -202,6 +206,17 @@ function renderToolBody(name, args) {
       html += `<div class="kv"><span class="k">…</span><span class="v">${edits.length - 5} more edits not shown</span></div>`;
     }
     return html;
+  }
+  if (name === "generate_image") {
+    const w = args.width || 512;
+    const h = args.height || 512;
+    return `
+      <div class="kv">
+        <span class="k">prompt</span><span class="v">${escapeHTML(args.prompt || "")}</span>
+        ${args.filename ? `<span class="k">filename</span><span class="v">${escapeHTML(args.filename)}</span>` : ""}
+        <span class="k">size</span><span class="v">${w} × ${h}px</span>
+        ${args.steps ? `<span class="k">steps</span><span class="v">${args.steps}</span>` : ""}
+      </div>`;
   }
   if (name === "write_file") {
     const content = String(args.content || "");
@@ -274,6 +289,17 @@ function appendToolResult(name, result, isError) {
     card.querySelector(".tool-body").appendChild(node);
     // Auto-expand if the tool errored so the user sees it
     if (isError) card.classList.remove("collapsed");
+    // Inline-render generated images right inside the tool card.
+    if (name === "generate_image" && !isError) {
+      const m = text.match(/saved to (\S+)/);
+      if (m) {
+        const src = "/" + m[1].replace(/\\/g, "/").replace(/^\/+/, "");
+        const img = fromHTML(`<img class="tool-image" alt="generated" loading="lazy">`);
+        img.src = src;
+        card.querySelector(".tool-body").appendChild(img);
+        card.classList.remove("collapsed");
+      }
+    }
   } else {
     messagesEl.appendChild(node);
   }
