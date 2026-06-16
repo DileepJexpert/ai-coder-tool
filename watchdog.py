@@ -8,11 +8,14 @@ against a local Ollama instance. Two deps only: requests + numpy.
 import argparse
 import base64
 import glob as _glob
+import hashlib
+import html
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -27,6 +30,7 @@ except Exception:
 # --- Configuration -----------------------------------------------------------
 
 OLLAMA_HOST          = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+A1111_HOST           = os.environ.get("A1111_HOST",  "http://localhost:7860")
 DEFAULT_MODEL        = "qwen3:8b"            # fits 8GB fully; fast tool-calling
 DEFAULT_VISION_MODEL = "moondream"           # light VLM for 8GB
 EMBED_MODEL          = "nomic-embed-text"    # ~270MB, used by codebase_rag
@@ -81,17 +85,34 @@ def BOLD(s):   return _c(s, "1")
 
 # --- System prompts ----------------------------------------------------------
 
-SYSTEM_PROMPT = """You are watchdog, a local coding assistant running on the user's own machine.
-You help with day-to-day coding: finding, reading, and editing code, running commands and tests, inspecting screenshots, and debugging.
+SYSTEM_PROMPT = """You are watchdog, a local AI assistant running entirely on the user's own machine.
+You help with anything — writing and editing code, writing documents, tutorials, blog posts
+and learning material for any audience, creating illustrations to go with them, exploring
+data, debugging, and other day-to-day tasks.
 
-Rules:
-- Work step by step. Use ONE tool at a time and read the result before the next step.
-- To find where something lives, call search_code (semantic) or grep/glob FIRST. Do not guess filenames.
-- Read a file before editing it. Make the smallest change that works. Use edit_file/multi_edit with exact, unique snippets.
+For CODE:
+- Use search_code (semantic) or grep/glob FIRST to find where something lives. Do not guess filenames.
+- Read a file before editing it. Make the smallest change that works. Use edit_file/multi_edit
+  with exact, unique snippets.
 - After changing code, run_tests to verify when a test command is available.
 - Use git (read-only) to inspect diffs and history; never assume what changed.
+
+For WRITING (tutorials, docs, blog posts, study material, stories, etc.):
+- Match the language and depth to the audience. Ask if it isn't clear who it's for.
+  Kids (class 1-5) need short sentences and concrete examples; adults can handle nuance.
+- Useful structure: short intro, worked examples, summary or practice questions.
+- When an illustration would help, call generate_image with a vivid prompt and the
+  STYLE HINTS appropriate to the audience and topic — e.g. "photorealistic, 4k" for
+  product shots, "digital painting, dramatic lighting" for art, "children's book
+  illustration, cartoon, flat colors" for kid material, "technical diagram, clean
+  vector style" for explainers. Don't default to a kid style unless that's the goal.
+- Save the final material as a markdown file with write_file. Reference any generated
+  images inline using ![alt](images/<file>) so they render in the chat.
+
+General rules:
+- Work step by step. Use ONE tool at a time and read the result before the next step.
 - For a large, self-contained sub-job, call run_subtask so the main context stays clean.
-- To inspect an image/screenshot/diagram, call analyze_image with a specific question.
+- To inspect a local image/diagram, call analyze_image with a specific question.
 - Keep explanations short. When done, give a one or two line summary and stop calling tools.
 - You operate on the user's real filesystem. Be careful with destructive commands.
 """
@@ -130,6 +151,36 @@ class Permissions:
             print()
             return False
         return ans in ("y", "yes")
+
+
+# --- Event sink --------------------------------------------------------------
+
+class EventSink:
+    """Receives agent-loop events. The default implementation prints to stdout
+    in the same look as the original CLI. Override the on_* methods to plug a
+    different frontend in (e.g. the Rich TUI in watchdog_tui.py)."""
+
+    def on_assistant_text(self, text: str, label: str = "agent") -> None:
+        if label == "agent":
+            print(BOLD(GREEN("\nwatchdog:")) + " " + text + "\n")
+
+    def on_tool_call(self, name: str, args: dict) -> None:
+        print(CYAN(f"-> {name}({_short_args(args)})"))
+
+    def on_tool_result(self, name: str, result: str) -> None:
+        print(DIM(f"   {_short_preview(result)}"))
+
+    def on_subtask_start(self, goal: str) -> None:
+        print(DIM(f"   [subtask start] goal={goal[:120]!r}"))
+
+    def on_subtask_end(self) -> None:
+        print(DIM("   [subtask end]"))
+
+    def on_error(self, message: str) -> None:
+        print(RED(message))
+
+    def on_round_cap(self, label: str, max_rounds: int) -> None:
+        print(YELLOW(f"[{label}] hit round limit ({max_rounds}) — stopping."))
 
 
 # --- File operation tools ----------------------------------------------------
@@ -437,10 +488,97 @@ def tool_analyze_image(path: str, question: str, vision_model: str) -> str:
         return f"ERROR: parsing vision response: {e}"
 
 
+# --- Image generation tool ---------------------------------------------------
+
+IMAGES_DIR = Path("images")
+
+
+def _safe_image_slug(name: str) -> str:
+    """Filename-safe ASCII slug. No path separators, no dotfiles, max 60 chars."""
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "_", name or "").strip("_").lower()
+    return s[:60] or "image"
+
+
+def _a1111_txt2img(prompt: str, width: int, height: int, steps: int):
+    """Call AUTOMATIC1111 / Forge text-to-image. Returns PNG bytes or None on any failure."""
+    try:
+        r = requests.post(
+            f"{A1111_HOST}/sdapi/v1/txt2img",
+            json={
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "sampler_name": "Euler a",
+            },
+            timeout=300,
+        )
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        imgs = r.json().get("images") or []
+        return base64.b64decode(imgs[0]) if imgs else None
+    except Exception:
+        return None
+
+
+def _stub_svg(prompt: str, width: int, height: int) -> bytes:
+    """Placeholder image: gradient + the prompt text. Used when SD isn't reachable."""
+    digest = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+    c1, c2 = "#" + digest[:6], "#" + digest[6:12]
+    body = html.escape(prompt)
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}">'
+        f'<defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">'
+        f'<stop offset="0%" stop-color="{c1}"/><stop offset="100%" stop-color="{c2}"/>'
+        f'</linearGradient></defs>'
+        f'<rect width="{width}" height="{height}" fill="url(#g)"/>'
+        f'<text x="{width // 2}" y="36" text-anchor="middle" font-family="sans-serif" '
+        f'font-size="20" font-weight="700" fill="white" opacity="0.85">[ stub image ]</text>'
+        f'<foreignObject x="20" y="60" width="{width - 40}" height="{height - 80}">'
+        f'<div xmlns="http://www.w3.org/1999/xhtml" '
+        f'style="color:white;font-family:sans-serif;font-size:18px;line-height:1.4;'
+        f'text-shadow:0 1px 4px rgba(0,0,0,0.4);word-wrap:break-word;">{body}</div>'
+        f'</foreignObject></svg>'
+    )
+    return svg.encode("utf-8")
+
+
+def tool_generate_image(prompt: str, filename: str = "",
+                        width: int = 512, height: int = 512, steps: int = 20) -> str:
+    if not prompt or not prompt.strip():
+        return "ERROR: empty prompt."
+    # Snap to multiples of 8 — most SD samplers require it; safe no-op otherwise.
+    width  = (max(64, min(int(width  or 512), 2048)) // 8) * 8
+    height = (max(64, min(int(height or 512), 2048)) // 8) * 8
+    steps  = max(1, min(int(steps or 20), 150))
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    slug = _safe_image_slug(filename or prompt)
+
+    png = _a1111_txt2img(prompt, width, height, steps)
+    if png is not None:
+        out = IMAGES_DIR / f"{ts}-{slug}.png"
+        out.write_bytes(png)
+        return f"OK: image saved to {out.as_posix()} (generated via {A1111_HOST})"
+
+    out = IMAGES_DIR / f"{ts}-{slug}.svg"
+    out.write_bytes(_stub_svg(prompt, width, height))
+    return (
+        f"OK: stub image saved to {out.as_posix()}\n"
+        f"NOTE: AUTOMATIC1111 was not reachable at {A1111_HOST} — wrote a placeholder SVG. "
+        f"Start AUTOMATIC1111 / Forge with `--api` to get real images."
+    )
+
+
 # --- Subtask tool ------------------------------------------------------------
 
 def tool_run_subtask(goal: str, model: str, vision_model: str,
-                     perms: "Permissions", depth: int) -> str:
+                     perms: "Permissions", depth: int, sink: "EventSink") -> str:
     if not goal or not goal.strip():
         return "ERROR: empty goal."
     if depth >= MAX_SUBTASK_DEPTH:
@@ -454,7 +592,7 @@ def tool_run_subtask(goal: str, model: str, vision_model: str,
         {"role": "system", "content": SUBTASK_SYSTEM_PROMPT},
         {"role": "user", "content": goal},
     ]
-    print(DIM(f"   [subtask start] goal={goal[:120]!r}"))
+    sink.on_subtask_start(goal)
     summary = agent_loop(
         messages=messages,
         model=model,
@@ -464,8 +602,9 @@ def tool_run_subtask(goal: str, model: str, vision_model: str,
         depth=depth + 1,
         max_rounds=10,
         label="subtask",
+        sink=sink,
     )
-    print(DIM("   [subtask end]"))
+    sink.on_subtask_end()
     return summary or "(subtask produced no text)"
 
 
@@ -708,6 +847,43 @@ TOOL_SPECS = [
     {
         "type": "function",
         "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate an image from a text prompt and save it under images/. "
+                "Use whenever a picture would help — diagrams, characters, scenes, charts, "
+                "covers, art for posts and tutorials, anything visual. Reference the saved "
+                "path in markdown as ![alt](images/<file>) so it renders inline in the chat. "
+                "Backend is AUTOMATIC1111 / Forge at $A1111_HOST (fully local); if it isn't "
+                "running, a labeled placeholder SVG is written so the rest of the workflow still runs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "Vivid description of the image. Use concrete language and include "
+                            "STYLE HINTS that match the goal — e.g. 'photorealistic, 4k, soft light' "
+                            "for realism, 'digital painting, dramatic lighting' for art, "
+                            "'children's book illustration, cartoon, flat colors' for kid material, "
+                            "'clean technical diagram, vector, labeled' for explainers."
+                        ),
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Short slug for the filename (no extension). Optional.",
+                    },
+                    "width":  {"type": "integer", "description": "Width in pixels, 64-2048. Default 512."},
+                    "height": {"type": "integer", "description": "Height in pixels, 64-2048. Default 512."},
+                    "steps":  {"type": "integer", "description": "Sampler steps, 1-150. Default 20."},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_subtask",
             "description": (
                 "Run an ISOLATED inner agent loop on a focused sub-job, with a fresh context. "
@@ -744,7 +920,7 @@ def _parse_args(raw):
     return {}
 
 
-def _call_tool(name, args, model, vision_model, perms, depth):
+def _call_tool(name, args, model, vision_model, perms, depth, sink):
     if name == "read_file":    return tool_read_file(args.get("path", ""))
     if name == "write_file":   return tool_write_file(args.get("path", ""), args.get("content", ""))
     if name == "edit_file":    return tool_edit_file(args.get("path", ""), args.get("old", ""), args.get("new", ""))
@@ -757,7 +933,15 @@ def _call_tool(name, args, model, vision_model, perms, depth):
     if name == "run_tests":    return tool_run_tests(args.get("command"))
     if name == "git":          return tool_git(args.get("subcommand", ""))
     if name == "analyze_image":return tool_analyze_image(args.get("path", ""), args.get("question", ""), vision_model)
-    if name == "run_subtask":  return tool_run_subtask(args.get("goal", ""), model, vision_model, perms, depth)
+    if name == "generate_image":
+        return tool_generate_image(
+            args.get("prompt", ""),
+            args.get("filename", ""),
+            int(args.get("width", 512) or 512),
+            int(args.get("height", 512) or 512),
+            int(args.get("steps", 20) or 20),
+        )
+    if name == "run_subtask":  return tool_run_subtask(args.get("goal", ""), model, vision_model, perms, depth, sink)
     return f"ERROR: unknown tool '{name}'"
 
 
@@ -821,20 +1005,23 @@ def _short_preview(s, limit=160) -> str:
 # --- The agent loop ----------------------------------------------------------
 
 def agent_loop(messages, model, vision_model, perms, tool_specs,
-               depth=0, max_rounds=None, label="agent") -> str:
+               depth=0, max_rounds=None, label="agent", sink=None) -> str:
     """One turn of the agent. Mutates `messages` in place.
 
     Returns the final assistant text (or an empty string on early failure).
+    Output is routed through `sink` (defaults to the print-based EventSink).
     """
     if max_rounds is None:
         max_rounds = MAX_TOOL_ROUNDS
+    if sink is None:
+        sink = EventSink()
 
     last_text = ""
     for _ in range(1, max_rounds + 1):
         try:
             resp = ollama_chat(model, messages, tool_specs)
         except RuntimeError as e:
-            print(RED(str(e)))
+            sink.on_error(str(e))
             return last_text
 
         msg = resp.get("message", {}) or {}
@@ -849,8 +1036,7 @@ def agent_loop(messages, model, vision_model, perms, tool_specs,
         if not tool_calls:
             content = msg.get("content", "") or ""
             last_text = content
-            if label == "agent":
-                print(BOLD(GREEN("\nwatchdog:")) + " " + content + "\n")
+            sink.on_assistant_text(content, label)
             return content
 
         # Execute each requested tool call sequentially.
@@ -859,26 +1045,25 @@ def agent_loop(messages, model, vision_model, perms, tool_specs,
             name = fn.get("name", "") or ""
             args = _parse_args(fn.get("arguments"))
 
-            print(CYAN(f"-> {name}({_short_args(args)})"))
+            sink.on_tool_call(name, args)
 
             if name in CONFIRM_TOOLS and not perms.ask(name, args):
                 result = "DENIED: user refused this action."
             else:
                 try:
-                    result = _call_tool(name, args, model, vision_model, perms, depth)
+                    result = _call_tool(name, args, model, vision_model, perms, depth, sink)
                 except Exception as e:
                     result = f"ERROR: tool '{name}' raised: {e}"
 
-            print(DIM(f"   {_short_preview(result)}"))
+            sink.on_tool_result(name, result)
             messages.append({
                 "role": "tool",
                 "name": name,
                 "content": str(result),
             })
 
-    capped = f"[{label}] hit round limit ({max_rounds}) — stopping."
-    print(YELLOW(capped))
-    return last_text or capped
+    sink.on_round_cap(label, max_rounds)
+    return last_text or f"[{label}] hit round limit ({max_rounds}) — stopping."
 
 
 # --- REPL --------------------------------------------------------------------
@@ -912,7 +1097,7 @@ def repl(model, vision_model, perms):
 
         messages.append({"role": "user", "content": user})
         try:
-            agent_loop(messages, model, vision_model, perms, TOOL_SPECS, depth=0)
+            agent_loop(messages, model, vision_model, perms, TOOL_SPECS, depth=0, sink=EventSink())
         except KeyboardInterrupt:
             print(YELLOW("\n(interrupted)"))
             continue
@@ -929,11 +1114,31 @@ def main():
                     help=f"Vision model (default: {DEFAULT_VISION_MODEL})")
     ap.add_argument("--yolo", action="store_true",
                     help="Skip all permission prompts.")
+    ap.add_argument("--web", action="store_true",
+                    help="Launch the browser chat UI instead of the CLI REPL "
+                         "(requires `pip install fastapi uvicorn`).")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="Bind address for --web (default: 127.0.0.1).")
+    ap.add_argument("--port", type=int, default=8765,
+                    help="Port for --web (default: 8765).")
     args = ap.parse_args()
 
-    perms = Permissions(args.yolo)
     try:
-        repl(args.model, args.vision_model, perms)
+        if args.web:
+            try:
+                from watchdog_web import serve
+            except ImportError as e:
+                print(
+                    "--web requires `fastapi` and `uvicorn`. Install with:\n"
+                    "  pip install fastapi uvicorn\n"
+                    f"  ({e})",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            serve(args.model, args.vision_model, args.yolo, args.host, args.port)
+        else:
+            perms = Permissions(args.yolo)
+            repl(args.model, args.vision_model, perms)
     except KeyboardInterrupt:
         print()
 

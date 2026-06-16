@@ -6,3 +6,6 @@ venv/
 
 # watchdog's local semantic-search index
 .watchdog_index.pkl
+
+# generated images & generated tutorials live in here; don't commit them
+images/
